@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   nginx:
     image: nginx:alpine
@@ -9,26 +11,95 @@ services:
       - user-service
       - product-service
       - order-service
+    networks:
+      - ecom-network
 
+  # --- MICROSERVICES ---
   user-service:
     build: 
       context: ../Services/user-service
-    ports:
-      - "5001:5001"
+    ## nginx public gateway ka kaam kar rha hai, isliye direct expose karne ki zarurat nahi hai, 
+    ## because application is accessable on 9000 port through nginx gateway
+    # ports:
+    #   - "5011:5001"
+    environment:
+      - DB_HOST=user-db
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+    depends_on:
+      - user-db
+    networks:
+      - ecom-network
 
   product-service:
     build: 
       context: ../Services/product-service
-    ports:
-      - "5002:5002"
+    # ports:
+    #   - "5012:5002"
+    environment:
+      - DB_HOST=product-db
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      - product-db
+      - redis
+    networks:
+      - ecom-network
 
   order-service:
     build: 
       context: ../Services/order-service
-    ports:
-      - "5003:5003"
-  
+    # ports:
+      # - "5013:5003"
+    environment:
+      - DB_HOST=order-db
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+    depends_on:
+      - order-db
+    networks:
+      - ecom-network
+
+  # --- REDIS CACHE ---
   redis:
-    image: redis:alpine
-    ports:
-      - "6379:6379"
+    build:
+      context: ../Redis
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    # No ports exposed here! Internal network only for security.
+    networks:
+      - ecom-network
+
+  # --- POSTGRES DATABASES ---
+  user-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: user_db
+    networks:
+      - ecom-network
+
+  product-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: product_db
+    networks:
+      - ecom-network
+
+  order-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: order_db
+    networks:
+      - ecom-network
+
+networks:
+  ecom-network:
+    driver: bridge

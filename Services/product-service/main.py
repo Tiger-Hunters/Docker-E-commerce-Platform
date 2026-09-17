@@ -1,24 +1,59 @@
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import uvicorn
 import redis
 import json
+import os
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+# --- Database Setup ---
+DB_USER = os.getenv("DB_USER", "admin")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "secret")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/product_db"
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class ProductDB(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(String)
+    price = Column(Float, nullable=False)
+    stockQuantity = Column(Integer, nullable=False)
+    category = Column(String)
+    isActive = Column(Boolean, default=True)
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Redis Setup (Hardened for Docker Drops) ---
+redis_client = redis.Redis(
+    host=os.getenv('REDIS_HOST', 'redis'),
+    port=6379,
+    password=os.getenv('REDIS_PASSWORD'),
+    db=0,
+    decode_responses=True,
+    socket_connect_timeout=2,
+    socket_timeout=2,
+    health_check_interval=2 # Drops dead connections from the pool instantly
+)
 
 app = FastAPI()
 
-# --- Connect to Redis Container ---
-# 'redis' is the exact service name from our docker-compose.yml
-redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
-
-# --- Custom Error Handler ---
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
-
-# --- In-Memory Database ---
-fake_product_db = {}
-product_id_counter = 101
 
 # --- Pydantic Models ---
 class ProductCreate(BaseModel):
@@ -28,14 +63,8 @@ class ProductCreate(BaseModel):
     stockQuantity: int
     category: str
 
-class ProductUpdate(BaseModel):
-    name: str
-    description: str
-    price: float
-    stockQuantity: int
-    category: str
-
 class ProductResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: int
     name: str
     description: str
@@ -50,72 +79,89 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/api/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
-def create_product(product: ProductCreate):
-    global product_id_counter
-    
-    new_product = product.dict()
-    new_product["id"] = product_id_counter
-    new_product["isActive"] = True
-    
-    fake_product_db[product_id_counter] = new_product
-    product_id_counter += 1
-    
+def create_product(product: ProductCreate, db: Session = Depends(get_db)):
+    new_product = ProductDB(**product.model_dump(), isActive=True)
+    db.add(new_product)
+    db.commit()
+    db.refresh(new_product)
     return new_product
 
 @app.get("/api/products", response_model=list[ProductResponse])
-def get_all_products():
-    # Return only active products
-    return [p for p in fake_product_db.values() if p["isActive"]]
+def get_all_products(db: Session = Depends(get_db)):
+    return db.query(ProductDB).filter(ProductDB.isActive == True).all()
 
 @app.get("/api/products/{product_id}")
-def get_product(product_id: int):
+def get_product(product_id: int, db: Session = Depends(get_db)):
     cache_key = f"product:{product_id}"
+    redis_available = True
     
-    # 1. Check Redis Cache First (HIT)
-    cached_product = redis_client.get(cache_key)
-    if cached_product:
-        print("REDIS HIT!") # You'll see this in Docker logs
-        return json.loads(cached_product)
+    # 1. FAULT-TOLERANT CACHE HIT
+    try:
+        cached = redis_client.get(cache_key)
+        if cached:
+            print(f"REDIS HIT for product {product_id}!", flush=True)
+            return json.loads(cached)
+    except Exception as e:
+        print(f"REDIS ERROR: {e}. Bypassing cache...", flush=True)
+        redis_available = False # Mini Circuit-Breaker: Mark Redis as dead
         
-    # 2. If not in cache (MISS), check Database
-    print("REDIS MISS! Fetching from DB...")
-    if product_id not in fake_product_db:
+    # 2. CACHE MISS / BYPASS -> Check DB
+    print(f"Fetching product {product_id} from DB...", flush=True)
+    db_product = db.query(ProductDB).filter(ProductDB.id == product_id, ProductDB.isActive == True).first()
+    
+    if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
         
-    product = fake_product_db[product_id]
+    product_dict = {
+        "id": db_product.id, "name": db_product.name, "description": db_product.description,
+        "price": db_product.price, "stockQuantity": db_product.stockQuantity, 
+        "category": db_product.category, "isActive": db_product.isActive
+    }
     
-    # 3. Save to Redis for next time (Cache it for 60 seconds)
-    redis_client.setex(cache_key, 60, json.dumps(product))
+    # 3. FAULT-TOLERANT CACHE SAVE
+    # Only attempt to save if Redis didn't crash during Step 1
+    if redis_available:
+        try:
+            redis_client.set(cache_key, json.dumps(product_dict), ex=3600)
+        except Exception as e:
+            print(f"REDIS SAVE ERROR: {e}. Silently failing.", flush=True)
     
-    return product
+    return product_dict
 
 @app.put("/api/products/{product_id}", response_model=ProductResponse)
-def update_product(product_id: int, product: ProductUpdate):
-    if product_id not in fake_product_db:
+def update_product(product_id: int, product: ProductCreate, db: Session = Depends(get_db)):
+    db_product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+    if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
         
-    # Update DB
-    updated_data = product.dict()
-    updated_data["id"] = product_id
-    updated_data["isActive"] = fake_product_db[product_id]["isActive"]
-    fake_product_db[product_id] = updated_data
+    for key, value in product.model_dump().items():
+        setattr(db_product, key, value)
+        
+    db.commit()
+    db.refresh(db_product)
     
-    # Update Redis Cache (Invalidation / Sync)
-    cache_key = f"product:{product_id}"
-    redis_client.setex(cache_key, 60, json.dumps(updated_data))
+    # Cache Invalidation
+    try:
+        redis_client.delete(f"product:{product_id}")
+    except Exception:
+        pass
     
-    return updated_data
+    return db_product
 
 @app.delete("/api/products/{product_id}")
-def delete_product(product_id: int):
-    if product_id not in fake_product_db:
+def delete_product(product_id: int, db: Session = Depends(get_db)):
+    db_product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+    if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
         
-    # Soft Delete (isActive = false)
-    fake_product_db[product_id]["isActive"] = False
+    db_product.isActive = False
+    db.commit()
     
-    # Remove from cache so users don't see deleted items!
-    redis_client.delete(f"product:{product_id}")
+    # Cache Invalidation
+    try:
+        redis_client.delete(f"product:{product_id}")
+    except Exception:
+        pass
     
     return {"message": "Product deleted successfully"}
 
