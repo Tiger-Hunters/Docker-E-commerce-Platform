@@ -1,20 +1,56 @@
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import uvicorn
 import requests
+import os
 from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
+
+# --- Database Setup ---
+DB_USER = os.getenv("DB_USER", "admin")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "secret")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/order_db"
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class OrderDB(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True, index=True)
+    userId = Column(Integer, nullable=False)
+    totalAmount = Column(Float, nullable=False)
+    status = Column(String, default="PENDING")
+    createdAt = Column(String, nullable=False)
+    items = relationship("OrderItemDB", back_populates="order")
+
+class OrderItemDB(Base):
+    __tablename__ = "order_items"
+    id = Column(Integer, primary_key=True, index=True)
+    orderId = Column(Integer, ForeignKey("orders.id"))
+    productId = Column(Integer, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    unitPrice = Column(Float, nullable=False)
+    subtotal = Column(Float, nullable=False)
+    order = relationship("OrderDB", back_populates="items")
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 app = FastAPI()
 
-# --- Custom Error Handler ---
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
-
-# --- In-Memory Database ---
-fake_order_db = {}
-order_id_counter = 1001
 
 # --- Pydantic Models ---
 class OrderItemCreate(BaseModel):
@@ -28,16 +64,30 @@ class OrderCreate(BaseModel):
 class OrderStatusUpdate(BaseModel):
     status: str
 
+class OrderItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    productId: int
+    quantity: int
+    unitPrice: float
+    subtotal: float
+
+class OrderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    userId: int
+    totalAmount: float
+    status: str
+    createdAt: str
+    items: list[OrderItemResponse]
+
 # --- API Routes ---
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
 
-@app.post("/api/orders", status_code=status.HTTP_201_CREATED)
-def create_order(order: OrderCreate):
-    global order_id_counter
-    
-    # 1. Verify User exists by calling User Service internally
+@app.post("/api/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+def create_order(order: OrderCreate, db: Session = Depends(get_db)):
+    # 1. Verify User
     try:
         user_res = requests.get(f"http://user-service:5001/api/users/{order.userId}")
         if user_res.status_code != 200:
@@ -46,8 +96,8 @@ def create_order(order: OrderCreate):
         raise HTTPException(status_code=500, detail="User Service is down")
 
     # 2. Fetch Products and Calculate Totals
-    processed_items = []
     total_amount = 0.0
+    db_items = []
 
     for item in order.items:
         try:
@@ -60,60 +110,63 @@ def create_order(order: OrderCreate):
             subtotal = unit_price * item.quantity
             total_amount += subtotal
             
-            processed_items.append({
-                "productId": item.productId,
-                "quantity": item.quantity,
-                "unitPrice": unit_price,
-                "subtotal": subtotal
-            })
+            db_items.append(OrderItemDB(
+                productId=item.productId,
+                quantity=item.quantity,
+                unitPrice=unit_price,
+                subtotal=subtotal
+            ))
         except requests.exceptions.RequestException:
             raise HTTPException(status_code=500, detail="Product Service is down")
 
-    # 3. Create and Save the Order
-    new_order = {
-        "id": order_id_counter,
-        "userId": order.userId,
-        "items": processed_items,
-        "totalAmount": total_amount,
-        "status": "PENDING",
-        "createdAt": datetime.now().isoformat()
-    }
+    # 3. Create and Save Order
+    new_order = OrderDB(
+        userId=order.userId,
+        totalAmount=total_amount,
+        status="PENDING",
+        createdAt=datetime.now().isoformat()
+    )
+    new_order.items = db_items
     
-    fake_order_db[order_id_counter] = new_order
-    order_id_counter += 1
+    db.add(new_order)
+    db.commit()
+    db.refresh(new_order)
     
     return new_order
 
-@app.get("/api/orders/{order_id}")
-def get_order(order_id: int):
-    if order_id not in fake_order_db:
+@app.get("/api/orders/{order_id}", response_model=OrderResponse)
+def get_order(order_id: int, db: Session = Depends(get_db)):
+    db_order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
+    if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
-    return fake_order_db[order_id]
+    return db_order
 
-@app.get("/api/users/{user_id}/orders")
-def get_user_orders(user_id: int):
-    # Filter orders for a specific user
-    user_orders = [o for o in fake_order_db.values() if o["userId"] == user_id]
-    return user_orders
+@app.get("/api/users/{user_id}/orders", response_model=list[OrderResponse])
+def get_user_orders(user_id: int, db: Session = Depends(get_db)):
+    return db.query(OrderDB).filter(OrderDB.userId == user_id).all()
 
 @app.put("/api/orders/{order_id}/status")
-def update_order_status(order_id: int, status_update: OrderStatusUpdate):
-    if order_id not in fake_order_db:
+def update_order_status(order_id: int, status_update: OrderStatusUpdate, db: Session = Depends(get_db)):
+    db_order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
+    if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
     
     valid_statuses = ["PENDING", "CONFIRMED", "CANCELLED", "COMPLETED"]
     if status_update.status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
         
-    fake_order_db[order_id]["status"] = status_update.status
+    db_order.status = status_update.status
+    db.commit()
     return {"id": order_id, "status": status_update.status}
 
 @app.delete("/api/orders/{order_id}")
-def cancel_order(order_id: int):
-    if order_id not in fake_order_db:
+def cancel_order(order_id: int, db: Session = Depends(get_db)):
+    db_order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
+    if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
         
-    fake_order_db[order_id]["status"] = "CANCELLED"
+    db_order.status = "CANCELLED"
+    db.commit()
     return {"message": "Order cancelled successfully"}
 
 if __name__ == "__main__":
