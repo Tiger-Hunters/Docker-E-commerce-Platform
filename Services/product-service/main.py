@@ -8,13 +8,37 @@ import os
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# --- Database Setup ---
-DB_USER = os.getenv("DB_USER", "admin")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "secret")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/product_db"
+from pathlib import Path
+from sqlalchemy.engine import URL
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+# --- Database Setup ---
+DB_USER = os.getenv("DB_USER", "ecom_user")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+
+def read_secret(file_env: str, fallback_env: str | None = None) -> str:
+    secret_file = os.getenv(file_env)
+    if secret_file:
+        return Path(secret_file).read_text(encoding="utf-8").strip()
+
+    # Local-development fallback only
+    if fallback_env:
+        return os.getenv(fallback_env, "secret")
+
+    raise RuntimeError(f"Missing required secret: {file_env}")
+
+DB_PASSWORD = read_secret("DB_PASSWORD_FILE", "DB_PASSWORD")
+
+DATABASE_URL = URL.create(
+    drivername="postgresql",
+    username=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    database="product_db",
+)
+
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -38,18 +62,66 @@ def get_db():
         db.close()
 
 # --- Redis Setup (Hardened for Docker Drops) ---
+
+# --- Redis Setup ---
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PASSWORD = read_secret("REDIS_PASSWORD_FILE", "REDIS_PASSWORD")
+
 redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'redis'),
+    host=REDIS_HOST,
     port=6379,
-    password=os.getenv('REDIS_PASSWORD'),
+    password=REDIS_PASSWORD,
     db=0,
     decode_responses=True,
     socket_connect_timeout=2,
     socket_timeout=2,
-    health_check_interval=2 # Drops dead connections from the pool instantly
+    health_check_interval=2,
 )
 
 app = FastAPI()
+# --- JWT Authentication ---
+def read_jwt_secret() -> str:
+    secret_file = os.getenv("JWT_SECRET_FILE")
+    if not secret_file:
+        raise RuntimeError("JWT_SECRET_FILE is required")
+    return Path(secret_file).read_text(encoding="utf-8").strip()
+
+
+JWT_SECRET = read_jwt_secret()
+JWT_ALGORITHM = "HS256"
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)
+) -> int:
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM]
+        )
+        user_id = int(payload["sub"])
+
+        if user_id <= 0:
+            raise ValueError("Invalid user ID")
+
+        return user_id
+
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
@@ -79,7 +151,7 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/api/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
-def create_product(product: ProductCreate, db: Session = Depends(get_db)):
+def create_product(product: ProductCreate,current_user_id: int = Depends(get_current_user), db: Session = Depends(get_db)):
     new_product = ProductDB(**product.model_dump(), isActive=True)
     db.add(new_product)
     db.commit()
@@ -129,7 +201,7 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
     return product_dict
 
 @app.put("/api/products/{product_id}", response_model=ProductResponse)
-def update_product(product_id: int, product: ProductCreate, db: Session = Depends(get_db)):
+def update_product(product_id: int, product: ProductCreate, current_user_id: int = Depends(get_current_user),db: Session = Depends(get_db)):
     db_product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
     if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -149,7 +221,7 @@ def update_product(product_id: int, product: ProductCreate, db: Session = Depend
     return db_product
 
 @app.delete("/api/products/{product_id}")
-def delete_product(product_id: int, db: Session = Depends(get_db)):
+def delete_product(product_id: int, current_user_id: int = Depends(get_current_user),db: Session = Depends(get_db)):
     db_product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
     if not db_product:
         raise HTTPException(status_code=404, detail="Product not found")
