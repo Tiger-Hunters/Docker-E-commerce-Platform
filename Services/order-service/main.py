@@ -5,16 +5,38 @@ import uvicorn
 import requests
 import os
 from datetime import datetime
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 
-# --- Database Setup ---
-DB_USER = os.getenv("DB_USER", "admin")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "secret")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/order_db"
+from pathlib import Path
+from sqlalchemy.engine import URL
+import jwt
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+# --- Database Setup ---
+
+DB_USER = os.getenv("DB_USER", "ecom_user")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+
+def read_secret():
+    secret_file = os.getenv("DB_PASSWORD_FILE")
+    if secret_file:
+        return Path(secret_file).read_text(encoding="utf-8").strip()
+
+    # Optional fallback for local development only
+    return os.getenv("DB_PASSWORD", "secret")
+
+DB_PASSWORD = read_secret()
+
+DATABASE_URL = URL.create(
+    drivername="postgresql",
+    username=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    database="order_db",
+)
+
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -47,6 +69,49 @@ def get_db():
         db.close()
 
 app = FastAPI()
+# --- JWT Authentication ---
+def read_jwt_secret() -> str:
+    secret_file = os.getenv("JWT_SECRET_FILE")
+    if not secret_file:
+        raise RuntimeError("JWT_SECRET_FILE is required")
+    return Path(secret_file).read_text(encoding="utf-8").strip()
+
+
+JWT_SECRET = read_jwt_secret()
+JWT_ALGORITHM = "HS256"
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)
+) -> int:
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM]
+        )
+        user_id = int(payload["sub"])
+
+        if user_id <= 0:
+            raise ValueError("Invalid user ID")
+
+        return user_id
+
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
@@ -86,10 +151,12 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/api/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
-def create_order(order: OrderCreate, db: Session = Depends(get_db)):
+def create_order(order: OrderCreate,current_user_id: int = Depends(get_current_user),credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),db: Session = Depends(get_db)):
+    if order.userId != current_user_id:
+        raise HTTPException(status_code=403,detail="You cannot create orders for another user")
     # 1. Verify User
     try:
-        user_res = requests.get(f"http://user-service:5001/api/users/{order.userId}")
+        user_res = requests.get(f"http://user-service:5001/api/users/{order.userId}",headers={"Authorization": f"Bearer {credentials.credentials}"})
         if user_res.status_code != 200:
             raise HTTPException(status_code=400, detail="Invalid User ID")
     except requests.exceptions.RequestException:
@@ -135,21 +202,27 @@ def create_order(order: OrderCreate, db: Session = Depends(get_db)):
     return new_order
 
 @app.get("/api/orders/{order_id}", response_model=OrderResponse)
-def get_order(order_id: int, db: Session = Depends(get_db)):
+def get_order(order_id: int, current_user_id: int = Depends(get_current_user),db: Session = Depends(get_db)):
     db_order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
     if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
+    if db_order.userId != current_user_id:
+        raise HTTPException(status_code=403,detail="You are not authorized to access this order")
     return db_order
 
 @app.get("/api/users/{user_id}/orders", response_model=list[OrderResponse])
-def get_user_orders(user_id: int, db: Session = Depends(get_db)):
+def get_user_orders(user_id: int, current_user_id: int = Depends(get_current_user),db: Session = Depends(get_db)):
+    if user_id != current_user_id:
+        raise HTTPException(status_code=403,detail="You are not authorized to access these orders")
     return db.query(OrderDB).filter(OrderDB.userId == user_id).all()
 
 @app.put("/api/orders/{order_id}/status")
-def update_order_status(order_id: int, status_update: OrderStatusUpdate, db: Session = Depends(get_db)):
+def update_order_status(order_id: int, status_update: OrderStatusUpdate, current_user_id: int = Depends(get_current_user),db: Session = Depends(get_db)):
     db_order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
     if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
+    if db_order.userId != current_user_id:
+        raise HTTPException(status_code=403,detail="You are not authorized to modify this order")
     
     valid_statuses = ["PENDING", "CONFIRMED", "CANCELLED", "COMPLETED"]
     if status_update.status not in valid_statuses:
@@ -160,10 +233,12 @@ def update_order_status(order_id: int, status_update: OrderStatusUpdate, db: Ses
     return {"id": order_id, "status": status_update.status}
 
 @app.delete("/api/orders/{order_id}")
-def cancel_order(order_id: int, db: Session = Depends(get_db)):
+def cancel_order(order_id: int, current_user_id: int = Depends(get_current_user),db: Session = Depends(get_db)):
     db_order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
     if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
+    if db_order.userId != current_user_id:
+        raise HTTPException(status_code=403,detail="You are not authorized to cancel this order")
         
     db_order.status = "CANCELLED"
     db.commit()

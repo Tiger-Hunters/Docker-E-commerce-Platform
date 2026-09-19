@@ -1,7 +1,9 @@
+
 FROM redis:7-alpine
 
-# Expose internal port
+COPY entrypoint.sh /usr/local/bin/redis-secret-entrypoint
+RUN chmod +x /usr/local/bin/redis-secret-entrypoint
+
 EXPOSE 6379
 
-# Use the environment variable to set the requirepass directive
-CMD ["sh", "-c", "redis-server --requirepass $REDIS_PASSWORD"]
+ENTRYPOINT ["/usr/local/bin/redis-secret-entrypoint"]
