@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // The NGINX API Gateway Base URL
 const API = axios.create({
-  baseURL: 'http://localhost/api', 
+  baseURL: '/api', 
 });
 
 // Intercept requests to add the JWT token if available
